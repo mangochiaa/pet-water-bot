@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+
+# Env (секреты)
+.env
+.env.local
+*.env
+
+# Данные бота (создаются автоматически)
+pets.json
+water_log.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
