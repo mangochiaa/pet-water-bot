@@ -5,19 +5,22 @@ Pet Water Tracker — Telegram-бот для учёта питья воды пи
     python bot.py
 
 Токен берётся из переменной окружения BOT_TOKEN (файл .env).
-Данные сохраняются в pets.json и water_log.json.
+Данные хранятся в SQLite (bot.db).
+При первом запуске старые pets.json и water_log.json переносятся в БД.
 """
 
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import os
-import uuid
+import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, date
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator, IO, Optional
 
 from dotenv import load_dotenv
 from telegram import (
@@ -40,25 +43,34 @@ from telegram.ext import (
 # Настройки и константы
 # ---------------------------------------------------------------------------
 
-# Загружаем переменные из .env (рядом с этим файлом)
 load_dotenv()
 
-# Пути к JSON-файлам с данными
 BASE_DIR = Path(__file__).resolve().parent
+DB_FILE = BASE_DIR / "bot.db"
 PETS_FILE = BASE_DIR / "pets.json"
 WATER_LOG_FILE = BASE_DIR / "water_log.json"
 
-# Состояния диалога /add_pet
+# Состояния диалогов (у каждого ConversationHandler свой набор)
 ASK_NAME, ASK_SPECIES, ASK_WEIGHT = range(3)
+ASK_WATER_PET, ASK_WATER_AMOUNT = range(3, 5)
 
-# Префикс callback-данных для отметки «попил воду»
 WATER_CALLBACK_PREFIX = "water:"
+SPECIES_CALLBACK_PREFIX = "species:"
+MAX_AMOUNT_ML = 2000
 
-# Главное меню (кнопки снизу экрана)
+# Кнопки вида: callback-ключ -> текст, который пишем в БД
+SPECIES_CHOICES = {
+    "dog": "Собака",
+    "cat": "Кот",
+    "bird": "Птица",
+    "rodent": "Грызун",
+}
+
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         ["➕ Добавить питомца", "🐾 Мои питомцы"],
-        ["💧 Попил воды", "📊 Статистика"],
+        ["💧 Попил воды", "📊 Сегодня"],
+        ["📅 За неделю", "🏆 Топ"],
         ["❓ Помощь"],
     ],
     resize_keyboard=True,
@@ -72,11 +84,81 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Работа с JSON-хранилищем
+# SQLite: подключение, схема, миграция из JSON
 # ---------------------------------------------------------------------------
 
+@contextmanager
+def get_db() -> Generator[sqlite3.Connection, None, None]:
+    """Открывает соединение с БД, фиксирует изменения или откатывает их."""
+    connection = sqlite3.connect(DB_FILE)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield connection
+        connection.commit()
+    except sqlite3.Error:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def init_db() -> None:
+    """Создаёт таблицы, если их ещё нет."""
+    try:
+        with get_db() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS pets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    species TEXT NOT NULL,
+                    weight REAL NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS water_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pet_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    amount_ml REAL NOT NULL DEFAULT 0,
+                    FOREIGN KEY (pet_id) REFERENCES pets(id)
+                );
+                """
+            )
+        migrate_amount_ml_column()
+        logger.info("База данных готова: %s", DB_FILE)
+    except sqlite3.Error as error:
+        logger.exception("Не удалось создать таблицы: %s", error)
+        raise SystemExit("Ошибка инициализации SQLite. Подробности в логе.")
+
+
+def migrate_amount_ml_column() -> None:
+    """Добавляет amount_ml в уже существующую таблицу water_log, если колонки нет.
+
+    Старым записям SQLite проставит DEFAULT 0 — объём тогда был неизвестен.
+    """
+    try:
+        with get_db() as connection:
+            columns = [
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(water_log)").fetchall()
+            ]
+            if "amount_ml" in columns:
+                return
+            connection.execute(
+                "ALTER TABLE water_log ADD COLUMN amount_ml REAL NOT NULL DEFAULT 0"
+            )
+        logger.info("Колонка water_log.amount_ml добавлена, старые записи = 0 мл")
+    except sqlite3.Error as error:
+        logger.exception("Не удалось добавить amount_ml: %s", error)
+        raise
+
+
 def _read_json(path: Path, default: Any) -> Any:
-    """Читает JSON-файл. Если файла нет или он повреждён — возвращает default."""
+    """Читает JSON для одноразовой миграции в SQLite."""
     try:
         if not path.exists():
             return default
@@ -87,112 +169,243 @@ def _read_json(path: Path, default: Any) -> Any:
         return default
 
 
-def _write_json(path: Path, data: Any) -> None:
-    """Сохраняет данные в JSON-файл с отступами для удобного чтения."""
+def migrate_json_to_sqlite() -> None:
+    """
+    Переносит данные из pets.json и water_log.json в bot.db.
+
+    Запускается при старте, только если JSON-файлы ещё лежат рядом с ботом.
+    Старые строковые id питомцев заменяются на INTEGER PRIMARY KEY;
+    записи журнала привязываются к новым id. После успеха JSON удаляются.
+    """
+    if not PETS_FILE.exists() and not WATER_LOG_FILE.exists():
+        return
+
+    pets_data = _read_json(PETS_FILE, {})
+    log_data = _read_json(WATER_LOG_FILE, [])
+    if not isinstance(pets_data, dict):
+        pets_data = {}
+    if not isinstance(log_data, list):
+        log_data = []
+
+    # Старый JSON-id -> новый INTEGER id в SQLite
+    id_map: dict[str, int] = {}
+    created_at = datetime.now().isoformat(timespec="seconds")
+
     try:
-        with path.open("w", encoding="utf-8") as file:
-            json.dump(data, file, ensure_ascii=False, indent=2)
-    except OSError as error:
-        logger.error("Не удалось записать %s: %s", path, error)
-        raise
+        with get_db() as connection:
+            for user_key, pets in pets_data.items():
+                try:
+                    user_id = int(user_key)
+                except (TypeError, ValueError):
+                    logger.warning("Пропущен некорректный user_id в JSON: %s", user_key)
+                    continue
+                if not isinstance(pets, list):
+                    continue
+                for pet in pets:
+                    old_id = str(pet.get("id", ""))
+                    weight = pet.get("weight", pet.get("weight_kg", 0))
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO pets (user_id, name, species, weight, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            user_id,
+                            str(pet.get("name", "Без имени")),
+                            str(pet.get("species", "не указан")),
+                            float(weight or 0),
+                            created_at,
+                        ),
+                    )
+                    if old_id:
+                        id_map[old_id] = cursor.lastrowid
+
+            for entry in log_data:
+                old_pet_id = str(entry.get("pet_id", ""))
+                new_pet_id = id_map.get(old_pet_id)
+                if new_pet_id is None:
+                    logger.warning("Пропущена запись журнала без питомца: %s", entry)
+                    continue
+                try:
+                    user_id = int(entry.get("user_id"))
+                except (TypeError, ValueError):
+                    continue
+                timestamp = str(entry.get("timestamp") or created_at)
+                connection.execute(
+                    """
+                    INSERT INTO water_log (pet_id, user_id, timestamp, amount_ml)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (new_pet_id, user_id, timestamp, 0),
+                )
+        logger.info(
+            "Миграция JSON → SQLite завершена: питомцев %s, записей журнала %s",
+            len(id_map),
+            len(log_data),
+        )
+    except (sqlite3.Error, TypeError, ValueError) as error:
+        logger.exception("Миграция JSON не удалась, файлы оставлены: %s", error)
+        return
+
+    # JSON больше не нужны; код миграции остаётся на случай повторного запуска
+    for path in (PETS_FILE, WATER_LOG_FILE):
+        try:
+            if path.exists():
+                path.unlink()
+                logger.info("Удалён старый файл %s", path.name)
+        except OSError as error:
+            logger.warning("Не удалось удалить %s: %s", path, error)
 
 
-def load_pets() -> dict[str, list[dict[str, Any]]]:
-    """
-    Загружает питомцев.
-
-    Формат:
-        {
-          "123456789": [
-            {"id": "...", "name": "Мурка", "species": "кот", "weight_kg": 4.2}
-          ]
-        }
-    Ключ — Telegram user_id в виде строки.
-    """
-    data = _read_json(PETS_FILE, {})
-    if not isinstance(data, dict):
-        return {}
-    return data
-
-
-def save_pets(pets: dict[str, list[dict[str, Any]]]) -> None:
-    """Сохраняет список питомцев."""
-    _write_json(PETS_FILE, pets)
-
-
-def load_water_log() -> list[dict[str, Any]]:
-    """
-    Загружает журнал поения.
-
-    Формат записи:
-        {"user_id": "...", "pet_id": "...", "timestamp": "2026-10-02T16:20:00"}
-    """
-    data = _read_json(WATER_LOG_FILE, [])
-    if not isinstance(data, list):
-        return []
-    return data
-
-
-def save_water_log(log: list[dict[str, Any]]) -> None:
-    """Сохраняет журнал поения."""
-    _write_json(WATER_LOG_FILE, log)
-
+# ---------------------------------------------------------------------------
+# Запросы к данным
+# ---------------------------------------------------------------------------
 
 def get_user_pets(user_id: int) -> list[dict[str, Any]]:
-    """Возвращает питомцев конкретного пользователя."""
-    return load_pets().get(str(user_id), [])
+    """Возвращает питомцев пользователя, от старых к новым."""
+    try:
+        with get_db() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, user_id, name, species, weight, created_at
+                FROM pets
+                WHERE user_id = ?
+                ORDER BY id
+                """,
+                (user_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.Error as error:
+        logger.exception("Ошибка чтения питомцев: %s", error)
+        return []
 
 
-def add_pet(user_id: int, name: str, species: str, weight_kg: float) -> dict[str, Any]:
+def get_pet(user_id: int, pet_id: int) -> Optional[dict[str, Any]]:
+    """Находит питомца по id, только если он принадлежит пользователю."""
+    try:
+        with get_db() as connection:
+            row = connection.execute(
+                """
+                SELECT id, user_id, name, species, weight, created_at
+                FROM pets
+                WHERE id = ? AND user_id = ?
+                """,
+                (pet_id, user_id),
+            ).fetchone()
+        return dict(row) if row else None
+    except sqlite3.Error as error:
+        logger.exception("Ошибка поиска питомца: %s", error)
+        return None
+
+
+def add_pet(user_id: int, name: str, species: str, weight: float) -> Optional[dict[str, Any]]:
     """Добавляет питомца и возвращает созданную запись."""
-    pets = load_pets()
-    user_key = str(user_id)
-    pet = {
-        "id": uuid.uuid4().hex[:8],
-        "name": name,
-        "species": species,
-        "weight_kg": weight_kg,
-    }
-    pets.setdefault(user_key, []).append(pet)
-    save_pets(pets)
-    return pet
+    created_at = datetime.now().isoformat(timespec="seconds")
+    try:
+        with get_db() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO pets (user_id, name, species, weight, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_id, name, species, weight, created_at),
+            )
+            pet_id = cursor.lastrowid
+        return {
+            "id": pet_id,
+            "user_id": user_id,
+            "name": name,
+            "species": species,
+            "weight": weight,
+            "created_at": created_at,
+        }
+    except sqlite3.Error as error:
+        logger.exception("Ошибка добавления питомца: %s", error)
+        return None
 
 
-def log_water(user_id: int, pet_id: str) -> bool:
-    """
-    Добавляет запись «питомец попил воду».
-    Возвращает False, если питомец не найден у этого пользователя.
-    """
-    pets = get_user_pets(user_id)
-    if not any(pet["id"] == pet_id for pet in pets):
+def log_water(user_id: int, pet_id: int, amount_ml: float) -> bool:
+    """Пишет отметку «попил воду» с объёмом в мл. False — питомец не найден или ошибка БД."""
+    if get_pet(user_id, pet_id) is None:
+        return False
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    try:
+        with get_db() as connection:
+            connection.execute(
+                """
+                INSERT INTO water_log (pet_id, user_id, timestamp, amount_ml)
+                VALUES (?, ?, ?, ?)
+                """,
+                (pet_id, user_id, timestamp, amount_ml),
+            )
+        return True
+    except sqlite3.Error as error:
+        logger.exception("Ошибка записи в журнал: %s", error)
         return False
 
-    log = load_water_log()
-    log.append(
-        {
-            "user_id": str(user_id),
-            "pet_id": pet_id,
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
-        }
-    )
-    save_water_log(log)
-    return True
+
+def _stats_map(rows: list[sqlite3.Row]) -> dict[int, tuple[int, float]]:
+    """pet_id -> (сколько раз, суммарный объём мл)."""
+    return {
+        int(row["pet_id"]): (int(row["times"]), float(row["total_ml"] or 0))
+        for row in rows
+    }
 
 
-def today_stats(user_id: int) -> dict[str, int]:
-    """Считает, сколько раз каждый питомец пил сегодня. Ключ — pet_id."""
-    today = date.today().isoformat()
-    counts: dict[str, int] = {}
-    for entry in load_water_log():
-        if entry.get("user_id") != str(user_id):
-            continue
-        timestamp = str(entry.get("timestamp", ""))
-        if not timestamp.startswith(today):
-            continue
-        pet_id = entry.get("pet_id")
-        if pet_id:
-            counts[pet_id] = counts.get(pet_id, 0) + 1
-    return counts
+def today_stats(user_id: int) -> dict[int, tuple[int, float]]:
+    """Отметки и объём за сегодня (локальная дата)."""
+    try:
+        with get_db() as connection:
+            rows = connection.execute(
+                """
+                SELECT pet_id,
+                       COUNT(*) AS times,
+                       COALESCE(SUM(amount_ml), 0) AS total_ml
+                FROM water_log
+                WHERE user_id = ?
+                  AND date(timestamp) = date('now', 'localtime')
+                GROUP BY pet_id
+                """,
+                (user_id,),
+            ).fetchall()
+        return _stats_map(rows)
+    except sqlite3.Error as error:
+        logger.exception("Ошибка статистики за сегодня: %s", error)
+        return {}
+
+
+def week_stats(user_id: int) -> dict[int, tuple[int, float]]:
+    """Отметки и объём за последние 7 дней."""
+    try:
+        with get_db() as connection:
+            rows = connection.execute(
+                """
+                SELECT pet_id,
+                       COUNT(*) AS times,
+                       COALESCE(SUM(amount_ml), 0) AS total_ml
+                FROM water_log
+                WHERE user_id = ?
+                  AND datetime(timestamp) >= datetime('now', 'localtime', '-7 days')
+                GROUP BY pet_id
+                """,
+                (user_id,),
+            ).fetchall()
+        return _stats_map(rows)
+    except sqlite3.Error as error:
+        logger.exception("Ошибка статистики за неделю: %s", error)
+        return {}
+
+
+def top_pets_week(user_id: int) -> list[tuple[dict[str, Any], int, float]]:
+    """Питомцы пользователя: сортировка по числу отметок за 7 дней."""
+    pets = get_user_pets(user_id)
+    stats = week_stats(user_id)
+    ranked = []
+    for pet in pets:
+        times, total_ml = stats.get(int(pet["id"]), (0, 0.0))
+        ranked.append((pet, times, total_ml))
+    ranked.sort(key=lambda item: (-item[1], item[0]["name"]))
+    return ranked
 
 
 def pets_keyboard(pets: list[dict[str, Any]]) -> InlineKeyboardMarkup:
@@ -207,6 +420,22 @@ def pets_keyboard(pets: list[dict[str, Any]]) -> InlineKeyboardMarkup:
         for pet in pets
     ]
     return InlineKeyboardMarkup(buttons)
+
+
+def species_keyboard() -> InlineKeyboardMarkup:
+    """Inline-кнопки выбора вида питомца."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🐶 Собака", callback_data=f"{SPECIES_CALLBACK_PREFIX}dog"),
+                InlineKeyboardButton("🐱 Кот", callback_data=f"{SPECIES_CALLBACK_PREFIX}cat"),
+            ],
+            [
+                InlineKeyboardButton("🐦 Птица", callback_data=f"{SPECIES_CALLBACK_PREFIX}bird"),
+                InlineKeyboardButton("🐹 Грызун", callback_data=f"{SPECIES_CALLBACK_PREFIX}rodent"),
+            ],
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -235,13 +464,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(
             "📖 Справка\n\n"
             "/start — приветствие и меню\n"
-            "/add_pet — добавить питомца (имя, вид, вес)\n"
+            "/add_pet — добавить питомца (имя, вид кнопкой, вес)\n"
             "/pets — список ваших питомцев\n"
-            "/water — отметить, что питомец попил воды\n"
-            "/stats — сколько раз пили сегодня\n"
+            "/water — отметить воду и объём в мл\n"
+            "/stats — сколько раз и сколько мл сегодня\n"
+            "/stats_week — статистика за последние 7 дней\n"
+            "/top — топ питомцев за неделю\n"
             "/help — эта справка\n"
-            "/cancel — отменить добавление питомца\n\n"
-            "Данные хранятся только у вас в файлах бота.",
+            "/cancel — отменить добавление питомца или запись воды\n\n"
+            "Данные хранятся в локальной базе SQLite (bot.db).",
             reply_markup=MAIN_MENU,
         )
     except Exception as error:
@@ -264,7 +495,7 @@ async def list_pets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines = ["🐾 Ваши питомцы:\n"]
         for index, pet in enumerate(pets, start=1):
             lines.append(
-                f"{index}. {pet['name']} — {pet['species']}, {pet['weight_kg']} кг"
+                f"{index}. {pet['name']} — {pet['species']}, {pet['weight']} кг"
             )
         await update.message.reply_text("\n".join(lines), reply_markup=MAIN_MENU)
     except Exception as error:
@@ -301,11 +532,15 @@ async def water_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not data.startswith(WATER_CALLBACK_PREFIX):
             return
 
-        pet_id = data[len(WATER_CALLBACK_PREFIX) :]
-        user_id = query.from_user.id
-        pets = get_user_pets(user_id)
-        pet = next((item for item in pets if item["id"] == pet_id), None)
+        raw_id = data[len(WATER_CALLBACK_PREFIX) :]
+        try:
+            pet_id = int(raw_id)
+        except ValueError:
+            await query.edit_message_text("Некорректный питомец. Откройте /water ещё раз.")
+            return
 
+        user_id = query.from_user.id
+        pet = get_pet(user_id, pet_id)
         if pet is None:
             await query.edit_message_text("Этот питомец не найден. Обновите список /pets.")
             return
@@ -317,7 +552,7 @@ async def water_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         now = datetime.now().strftime("%H:%M")
         await query.edit_message_text(
             f"💧 Отмечено: {pet['name']} попил(а) воду в {now}.\n"
-            "Так держать! Можно посмотреть статистику: /stats"
+            "Статистика: /stats · за неделю: /stats_week · топ: /top"
         )
     except Exception as error:
         logger.exception("Ошибка в water_callback: %s", error)
@@ -325,6 +560,18 @@ async def water_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.edit_message_text("Произошла ошибка при сохранении отметки.")
         except Exception:
             pass
+
+
+def _format_stats(title: str, pets: list[dict[str, Any]], counts: dict[int, int]) -> str:
+    """Собирает текст статистики по списку питомцев."""
+    lines = [title, ""]
+    total = 0
+    for pet in pets:
+        times = counts.get(int(pet["id"]), 0)
+        total += times
+        lines.append(f"• {pet['name']}: {times} {_times_word(times)}")
+    lines.append(f"\nВсего отметок: {total}")
+    return "\n".join(lines)
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -339,21 +586,64 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
             return
 
-        counts = today_stats(user_id)
         today_label = date.today().strftime("%d.%m.%Y")
-        lines = [f"📊 Статистика за сегодня ({today_label}):\n"]
-        total = 0
-        for pet in pets:
-            times = counts.get(pet["id"], 0)
-            total += times
-            word = _times_word(times)
-            lines.append(f"• {pet['name']}: {times} {word}")
-
-        lines.append(f"\nВсего отметок: {total}")
-        await update.message.reply_text("\n".join(lines), reply_markup=MAIN_MENU)
+        text = _format_stats(
+            f"📊 Статистика за сегодня ({today_label}):",
+            pets,
+            today_stats(user_id),
+        )
+        await update.message.reply_text(text, reply_markup=MAIN_MENU)
     except Exception as error:
         logger.exception("Ошибка в /stats: %s", error)
         await _safe_reply(update, "Не получилось посчитать статистику.")
+
+
+async def stats_week_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ /stats_week — сколько раз каждый питомец пил за 7 дней. """
+    try:
+        user_id = update.effective_user.id
+        pets = get_user_pets(user_id)
+        if not pets:
+            await update.message.reply_text(
+                "Нет питомцев — нечего считать. Добавьте питомца: /add_pet",
+                reply_markup=MAIN_MENU,
+            )
+            return
+
+        text = _format_stats(
+            "📅 Статистика за последние 7 дней:",
+            pets,
+            week_stats(user_id),
+        )
+        await update.message.reply_text(text, reply_markup=MAIN_MENU)
+    except Exception as error:
+        logger.exception("Ошибка в /stats_week: %s", error)
+        await _safe_reply(update, "Не получилось посчитать статистику за неделю.")
+
+
+async def top_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ /top — рейтинг питомцев по числу отметок за неделю. """
+    try:
+        user_id = update.effective_user.id
+        ranked = top_pets_week(user_id)
+        if not ranked:
+            await update.message.reply_text(
+                "Нет питомцев для рейтинга. Добавьте питомца: /add_pet",
+                reply_markup=MAIN_MENU,
+            )
+            return
+
+        medals = ["🥇", "🥈", "🥉"]
+        lines = ["🏆 Топ питомцев за 7 дней:\n"]
+        for index, (pet, times) in enumerate(ranked, start=1):
+            medal = medals[index - 1] if index <= 3 else f"{index}."
+            lines.append(
+                f"{medal} {pet['name']} ({pet['species']}) — {times} {_times_word(times)}"
+            )
+        await update.message.reply_text("\n".join(lines), reply_markup=MAIN_MENU)
+    except Exception as error:
+        logger.exception("Ошибка в /top: %s", error)
+        await _safe_reply(update, "Не получилось построить топ.")
 
 
 def _times_word(count: int) -> str:
@@ -448,16 +738,21 @@ async def add_pet_weight(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         name = context.user_data.get("new_pet_name", "Без имени")
         species = context.user_data.get("new_pet_species", "не указан")
         pet = add_pet(update.effective_user.id, name, species, round(weight, 2))
-
-        # Очищаем временные данные диалога
         context.user_data.pop("new_pet_name", None)
         context.user_data.pop("new_pet_species", None)
+
+        if pet is None:
+            await update.message.reply_text(
+                "Не получилось сохранить питомца в базу. Попробуйте /add_pet ещё раз.",
+                reply_markup=MAIN_MENU,
+            )
+            return ConversationHandler.END
 
         await update.message.reply_text(
             f"✅ Питомец добавлен!\n\n"
             f"Имя: {pet['name']}\n"
             f"Вид: {pet['species']}\n"
-            f"Вес: {pet['weight_kg']} кг\n\n"
+            f"Вес: {pet['weight']} кг\n\n"
             "Отметить воду можно командой /water.",
             reply_markup=MAIN_MENU,
         )
@@ -518,11 +813,24 @@ async def _safe_reply(update: Update, text: str) -> None:
 # Точка входа
 # ---------------------------------------------------------------------------
 
-def build_application(token: str) -> Application:
-    """Собирает Application и регистрирует все обработчики."""
-    application = Application.builder().token(token).build()
+async def _delete_webhook(application: Application) -> None:
+    """Перед polling снимаем webhook, иначе апдейты могут приходить дважды."""
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    logger.info(
+        "Webhook удалён. Хендлеров в группе 0: %s",
+        len(application.handlers.get(0, [])),
+    )
 
-    # Пошаговое добавление питомца
+
+def build_application(token: str) -> Application:
+    """Собирает Application и регистрирует каждый обработчик ровно один раз."""
+    application = (
+        Application.builder()
+        .token(token)
+        .post_init(_delete_webhook)
+        .build()
+    )
+
     add_pet_conversation = ConversationHandler(
         entry_points=[
             CommandHandler("add_pet", add_pet_start),
@@ -534,6 +842,7 @@ def build_application(token: str) -> Application:
             ASK_WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_pet_weight)],
         },
         fallbacks=[CommandHandler("cancel", cancel_add_pet)],
+        block=True,
     )
 
     application.add_handler(CommandHandler("start", start))
@@ -545,8 +854,14 @@ def build_application(token: str) -> Application:
     application.add_handler(CommandHandler("water", water_command))
     application.add_handler(MessageHandler(filters.Regex("^💧 Попил воды$"), water_command))
     application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(MessageHandler(filters.Regex("^📊 Статистика$"), stats_command))
-    application.add_handler(CallbackQueryHandler(water_callback, pattern=f"^{WATER_CALLBACK_PREFIX}"))
+    application.add_handler(MessageHandler(filters.Regex("^📊 Сегодня$"), stats_command))
+    application.add_handler(CommandHandler("stats_week", stats_week_command))
+    application.add_handler(MessageHandler(filters.Regex("^📅 За неделю$"), stats_week_command))
+    application.add_handler(CommandHandler("top", top_command))
+    application.add_handler(MessageHandler(filters.Regex("^🏆 Топ$"), top_command))
+    application.add_handler(
+        CallbackQueryHandler(water_callback, pattern=f"^{WATER_CALLBACK_PREFIX}")
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_text))
     application.add_error_handler(error_handler)
 
@@ -554,12 +869,7 @@ def build_application(token: str) -> Application:
 
 
 def _ensure_event_loop() -> None:
-    """Создаёт текущий event loop, если его ещё нет.
-
-    python-telegram-bot 21.x внутри вызывает asyncio.get_event_loop().
-    На Python 3.12+ (в том числе 3.14) в главном потоке loop больше
-    не создаётся автоматически, из-за чего возникает RuntimeError.
-    """
+    """Создаёт текущий event loop, если его ещё нет (Python 3.12+)."""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_closed():
@@ -568,18 +878,44 @@ def _ensure_event_loop() -> None:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
 
+def _acquire_singleton_lock() -> IO[str]:
+    """Не даёт запустить второй процесс с тем же ботом."""
+    lock_path = BASE_DIR / ".bot.lock"
+    lock_file = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        raise SystemExit(
+            "Бот уже запущен в другом процессе (терминал, IDE, сервер). "
+            "Остановите лишний экземпляр — из-за него ответы приходят дважды."
+        )
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
+
+
 def main() -> None:
-    """Читает токен и запускает long polling."""
+    """Готовит БД, читает токен и запускает long polling."""
     token = os.getenv("BOT_TOKEN")
     if not token or token == "your_token_here":
         raise SystemExit(
             "Не задан BOT_TOKEN. Скопируйте .env.example в .env и вставьте токен от @BotFather."
         )
 
+    _lock_file = _acquire_singleton_lock()
+    init_db()
+    migrate_json_to_sqlite()
+
     _ensure_event_loop()
     application = build_application(token)
-    logger.info("Бот Pet Water Tracker запущен")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Бот Pet Water Tracker запущен, pid=%s", os.getpid())
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query"],
+    )
+
+    _lock_file.close()
 
 
 if __name__ == "__main__":

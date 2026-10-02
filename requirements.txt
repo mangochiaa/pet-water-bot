@@ -1,2 +1,3 @@
 python-telegram-bot==21.7
 python-dotenv==1.0.1
+# sqlite3 входит в стандартную библиотеку Python — отдельно ставить не нужно
