@@ -5,7 +5,8 @@ Pet Water Tracker — Telegram-бот для учёта питья воды пи
     python bot.py
 
 Токен берётся из переменной окружения BOT_TOKEN (файл .env).
-Данные хранятся в SQLite (bot.db).
+Данные хранятся в SQLite: по умолчанию bot.db рядом с кодом,
+путь можно задать переменной окружения DB_PATH (например, для Railway Volume).
 При первом запуске старые pets.json и water_log.json переносятся в БД,
 а схема старой базы автоматически дополняется новыми колонками.
 """
@@ -49,7 +50,11 @@ from telegram.warnings import PTBUserWarning
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_FILE = BASE_DIR / "bot.db"
+# Путь к базе можно переопределить через DB_PATH — например, /data/bot.db
+# на Railway Volume, чтобы данные переживали редеплой. `or` (а не значение
+# по умолчанию в getenv) защищает от пустой переменной: с "" SQLite
+# молча открыл бы временную базу, и данные терялись бы.
+DB_PATH = os.getenv("DB_PATH") or str(BASE_DIR / "bot.db")
 PETS_FILE = BASE_DIR / "pets.json"
 WATER_LOG_FILE = BASE_DIR / "water_log.json"
 
@@ -161,7 +166,7 @@ EMPTY_STATS = PetStats(0, 0.0, 0)
 @contextmanager
 def get_db() -> Generator[sqlite3.Connection, None, None]:
     """Открывает соединение с БД, фиксирует изменения или откатывает их."""
-    connection = sqlite3.connect(DB_FILE)
+    connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     try:
@@ -176,6 +181,14 @@ def get_db() -> Generator[sqlite3.Connection, None, None]:
 
 def init_db() -> None:
     """Создаёт таблицы (если их нет) и доводит старую схему до актуальной."""
+    # Папка под базу может ещё не существовать (например, /data без Volume) —
+    # без неё SQLite падает с невнятным «unable to open database file»
+    try:
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        logger.exception("Не удалось создать папку для базы %s: %s", DB_PATH, error)
+        raise SystemExit("Нет доступа к папке базы данных. Проверьте DB_PATH.")
+
     try:
         with get_db() as connection:
             connection.executescript(
@@ -205,7 +218,7 @@ def init_db() -> None:
         migrate_pets_columns()
         migrate_water_log_amount()
         backfill_species_codes()
-        logger.info("База данных готова: %s", DB_FILE)
+        logger.info("База данных готова: %s", DB_PATH)
     except sqlite3.Error as error:
         logger.exception("Не удалось подготовить базу: %s", error)
         raise SystemExit("Ошибка инициализации SQLite. Подробности в логе.")
@@ -334,7 +347,7 @@ def _read_json(path: Path, default: Any) -> Any:
 
 def migrate_json_to_sqlite() -> None:
     """
-    Переносит данные из pets.json и water_log.json в bot.db.
+    Переносит данные из pets.json и water_log.json в SQLite (DB_PATH).
 
     Запускается при старте, только если JSON-файлы ещё лежат рядом с ботом.
     Старые строковые id питомцев заменяются на INTEGER PRIMARY KEY;
@@ -824,7 +837,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "/delete_pet — удалить питомца вместе с его отметками\n"
             "/help — эта справка\n"
             "/cancel — отменить добавление питомца или ввод мл\n\n"
-            "Данные хранятся в локальной базе SQLite (bot.db).",
+            "Данные хранятся в базе SQLite.",
             reply_markup=MAIN_MENU,
         )
     except Exception as error:
