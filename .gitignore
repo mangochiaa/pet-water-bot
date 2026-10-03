@@ -17,6 +17,7 @@ env/
 pets.json
 water_log.json
 bot.db
+bot.db.backup*
 .bot.lock
 
 # IDE
