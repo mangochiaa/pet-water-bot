@@ -62,6 +62,11 @@ WATER_CALLBACK_PREFIX = "water:"        # выбран питомец в /water
 WATER_MARK_PREFIX = "water_mark:"       # «Просто отметка» без объёма
 WATER_ML_PREFIX = "water_ml:"           # «Указать мл» — дальше ждём число
 SPECIES_CALLBACK_PREFIX = "species:"    # выбор вида в /add_pet
+# Удаление питомца. У каждого шага свой префикс, чтобы кнопки из старых
+# сообщений не срабатывали как кнопки другого шага.
+DELETE_PICK_PREFIX = "delete_pet:"             # выбран питомец в /delete_pet
+DELETE_CONFIRM_PREFIX = "delete_pet_confirm:"  # «✅ Да, удалить»
+DELETE_CANCEL_PREFIX = "delete_pet_cancel:"    # «❌ Отмена»
 
 # Границы допустимых значений
 MAX_AMOUNT_ML = 2000
@@ -118,7 +123,8 @@ MAIN_MENU = ReplyKeyboardMarkup(
         ["➕ Добавить питомца", "🐾 Мои питомцы"],
         ["💧 Попил воды", "📊 Сегодня"],
         ["📅 За неделю", "🏆 Топ"],
-        ["📊 Норма воды", "❓ Помощь"],
+        ["📊 Норма воды", "🗑 Удалить питомца"],
+        ["❓ Помощь"],
     ],
     resize_keyboard=True,
 )
@@ -528,6 +534,41 @@ def log_water(user_id: int, pet_id: int, amount_ml: Optional[float] = None) -> b
         return False
 
 
+def delete_pet(user_id: int, pet_id: int) -> Optional[int]:
+    """
+    Удаляет питомца вместе со всеми его отметками о питье.
+
+    Удалить можно только своего питомца: владелец проверяется по user_id
+    в той же транзакции, что и удаление. Сначала удаляем записи water_log,
+    потом сам питомец — иначе PRAGMA foreign_keys не даст удалить строку,
+    на которую ссылается журнал. Ошибка на любом шаге откатывает всё.
+
+    Возвращает число удалённых отметок; None — питомец не найден
+    (или чужой) либо ошибка БД.
+    """
+    try:
+        with get_db() as connection:
+            owned = connection.execute(
+                "SELECT 1 FROM pets WHERE id = ? AND user_id = ?",
+                (pet_id, user_id),
+            ).fetchone()
+            if owned is None:
+                return None
+
+            log_cursor = connection.execute(
+                "DELETE FROM water_log WHERE pet_id = ?",
+                (pet_id,),
+            )
+            connection.execute(
+                "DELETE FROM pets WHERE id = ? AND user_id = ?",
+                (pet_id, user_id),
+            )
+        return log_cursor.rowcount
+    except sqlite3.Error as error:
+        logger.exception("Ошибка удаления питомца: %s", error)
+        return None
+
+
 def _stats_map(rows: list[sqlite3.Row]) -> dict[int, PetStats]:
     """pet_id -> PetStats."""
     return {
@@ -780,6 +821,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "/stats_week — статистика за последние 7 дней\n"
             "/top — топ питомцев за неделю\n"
             "/norm — дневная норма воды и сколько выпито сегодня\n"
+            "/delete_pet — удалить питомца вместе с его отметками\n"
             "/help — эта справка\n"
             "/cancel — отменить добавление питомца или ввод мл\n\n"
             "Данные хранятся в локальной базе SQLite (bot.db).",
@@ -1105,6 +1147,118 @@ async def water_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         context.user_data.pop("water_pet_id", None)
         await _safe_reply(update, "Произошла ошибка при сохранении отметки.")
         return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Удаление питомца: /delete_pet -> питомец -> «Да, удалить» или «Отмена»
+# ---------------------------------------------------------------------------
+
+def delete_pets_keyboard(pets: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    """По одной кнопке на питомца для выбора, кого удалить."""
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=f"{species_emoji(pet)} {pet['name']} ({species_label(pet)})",
+                callback_data=f"{DELETE_PICK_PREFIX}{pet['id']}",
+            )
+        ]
+        for pet in pets
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def delete_confirm_keyboard(pet_id: int) -> InlineKeyboardMarkup:
+    """Подтверждение удаления конкретного питомца."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Да, удалить", callback_data=f"{DELETE_CONFIRM_PREFIX}{pet_id}"),
+                InlineKeyboardButton("❌ Отмена", callback_data=f"{DELETE_CANCEL_PREFIX}{pet_id}"),
+            ]
+        ]
+    )
+
+
+async def delete_pet_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """ /delete_pet — выбор питомца для удаления. """
+    try:
+        pets = get_user_pets(update.effective_user.id)
+        if not pets:
+            await update.message.reply_text("У вас пока нет питомцев.", reply_markup=MAIN_MENU)
+            return
+
+        await update.message.reply_text(
+            "Кого удалить? Нажмите на имя:",
+            reply_markup=delete_pets_keyboard(pets),
+        )
+    except Exception as error:
+        logger.exception("Ошибка в /delete_pet: %s", error)
+        await _safe_reply(update, "Не получилось показать список питомцев для удаления.")
+
+
+async def delete_pet_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Нажата кнопка питомца: просим подтвердить удаление."""
+    query = update.callback_query
+    try:
+        await query.answer()
+        pet_id = _pet_id_from_callback(query.data or "", DELETE_PICK_PREFIX)
+        pet = get_pet(query.from_user.id, pet_id) if pet_id is not None else None
+        if pet is None:
+            await query.edit_message_text("Этот питомец не найден. Обновите список /pets.")
+            return
+
+        await query.edit_message_text(
+            f"Удалить {pet['name']}? Все отметки о питье тоже будут удалены.",
+            reply_markup=delete_confirm_keyboard(pet_id),
+        )
+    except Exception as error:
+        logger.exception("Ошибка в delete_pet_chosen: %s", error)
+        try:
+            await query.edit_message_text("Произошла ошибка. Откройте /delete_pet ещё раз.")
+        except Exception:
+            pass
+
+
+async def delete_pet_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """«✅ Да, удалить» — удаляем питомца и его журнал, только если он свой."""
+    query = update.callback_query
+    try:
+        await query.answer()
+        pet_id = _pet_id_from_callback(query.data or "", DELETE_CONFIRM_PREFIX)
+        user_id = query.from_user.id
+        # Имя берём заранее: после удаления строки в базе уже не будет
+        pet = get_pet(user_id, pet_id) if pet_id is not None else None
+        if pet is None:
+            await query.edit_message_text("Этот питомец не найден — возможно, он уже удалён.")
+            return
+
+        if delete_pet(user_id, pet_id) is None:
+            await query.edit_message_text("Не удалось удалить питомца. Попробуйте /delete_pet ещё раз.")
+            return
+
+        # Если пользователь как раз вводил мл для этого питомца — забываем его
+        if context.user_data.get("water_pet_id") == pet_id:
+            context.user_data.pop("water_pet_id", None)
+
+        await query.edit_message_text(f"Питомец {pet['name']} удалён.")
+    except Exception as error:
+        logger.exception("Ошибка в delete_pet_confirm: %s", error)
+        try:
+            await query.edit_message_text("Произошла ошибка при удалении питомца.")
+        except Exception:
+            pass
+
+
+async def delete_pet_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """«❌ Отмена» — ничего не удаляем и возвращаем главное меню."""
+    query = update.callback_query
+    try:
+        await query.answer()
+        await query.edit_message_text("Удаление отменено.")
+        # Inline-сообщение не может нести ReplyKeyboard, поэтому меню — отдельным сообщением
+        await query.message.reply_text("Главное меню 👇", reply_markup=MAIN_MENU)
+    except Exception as error:
+        logger.exception("Ошибка в delete_pet_cancel: %s", error)
 
 
 # ---------------------------------------------------------------------------
@@ -1453,11 +1607,22 @@ def build_application(token: str) -> Application:
     application.add_handler(MessageHandler(filters.Regex("^🏆 Топ$"), top_command))
     application.add_handler(CommandHandler("norm", norm_command))
     application.add_handler(MessageHandler(filters.Regex("^📊 Норма воды$"), norm_command))
+    application.add_handler(CommandHandler("delete_pet", delete_pet_command))
+    application.add_handler(MessageHandler(filters.Regex("^🗑 Удалить питомца$"), delete_pet_command))
     application.add_handler(
         CallbackQueryHandler(water_pet_chosen, pattern=rf"^{WATER_CALLBACK_PREFIX}\d+$")
     )
     application.add_handler(
         CallbackQueryHandler(water_simple_mark, pattern=rf"^{WATER_MARK_PREFIX}\d+$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(delete_pet_chosen, pattern=rf"^{DELETE_PICK_PREFIX}\d+$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(delete_pet_confirm, pattern=rf"^{DELETE_CONFIRM_PREFIX}\d+$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(delete_pet_cancel, pattern=rf"^{DELETE_CANCEL_PREFIX}\d+$")
     )
     # Любая другая кнопка (например, выбор вида после /cancel) — «устарела»
     application.add_handler(CallbackQueryHandler(stale_callback))
